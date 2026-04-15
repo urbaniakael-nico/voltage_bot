@@ -3,8 +3,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import requests
 import httpx
 import asyncio
+import os
 
-TOKEN = "8750941741:AAGDE9toGadffHKN21xROOJ_4Nw6bAUXP4Q"
+TOKEN = os.getenv("TOKEN")
 API_URL = "https://script.google.com/macros/s/AKfycbwML0xRC_LbRHSTxVuWvJIbRWr1PilhZQgRRNbIo48zoeTBSVguyYtpoErgx0a_Gwe9/exec"
 
 # =========================
@@ -245,7 +246,7 @@ def main():
     app.add_handler(MessageHandler(filters.LOCATION, ubicacion))
     app.add_handler(MessageHandler(filters.TEXT, manejar))
 
-    print("🚀 BOT 24/7 ACTIVO (CLOUD READY)")
+    print("🚀 BOT CLOUD VERSION 2(CLOUD READY)")
 
     app.run_polling(drop_pending_updates=True)
 

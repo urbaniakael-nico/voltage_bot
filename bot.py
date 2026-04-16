@@ -8,10 +8,7 @@ import os
 # =========================
 # 🔑 TOKEN DESDE RAILWAY
 # =========================
-TOKEN = os.getenv("TOKEN")
-
-if not TOKEN:
-    raise ValueError("❌ TOKEN no definido en Railway (Variables)")
+TOKEN = os.getenv("TOKEN") or "8750941741:AAGDE9toGadffHKN21xROOJ_4Nw6bAUXP4Q"
 
 API_URL = "https://script.google.com/macros/s/AKfycbwML0xRC_LbRHSTxVuWvJIbRWr1PilhZQgRRNbIo48zoeTBSVguyYtpoErgx0a_Gwe9/exec"
 

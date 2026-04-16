@@ -5,11 +5,18 @@ import httpx
 import asyncio
 import os
 
+# =========================
+# 🔑 TOKEN DESDE RAILWAY
+# =========================
 TOKEN = os.getenv("TOKEN")
+
+if not TOKEN:
+    raise ValueError("❌ TOKEN no definido en Railway (Variables)")
+
 API_URL = "https://script.google.com/macros/s/AKfycbwML0xRC_LbRHSTxVuWvJIbRWr1PilhZQgRRNbIo48zoeTBSVguyYtpoErgx0a_Gwe9/exec"
 
 # =========================
-# 🚀 CLIENTE GLOBAL (CLAVE PARA RENDER)
+# 🚀 CLIENTE GLOBAL
 # =========================
 client = httpx.AsyncClient(timeout=5)
 
@@ -236,17 +243,17 @@ async def ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
-# 🚀 MAIN (ESTABLE CLOUD)
+# 🚀 MAIN CLOUD
 # =========================
 def main():
+
+    print("🚀 BOT CLOUD VERSION 3 (TOKEN OK)")
 
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.LOCATION, ubicacion))
     app.add_handler(MessageHandler(filters.TEXT, manejar))
-
-    print("🚀 BOT CLOUD VERSION 2(CLOUD READY)")
 
     app.run_polling(drop_pending_updates=True)
 

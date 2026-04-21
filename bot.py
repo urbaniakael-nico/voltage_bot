@@ -1,13 +1,14 @@
+import asyncio
 import logging
 import os
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, KeyboardButton, Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -26,9 +27,9 @@ HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "3.0"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 
 if not TOKEN:
-    raise ValueError("8750941741:AAGDE9toGadffHKN21xROOJ_4Nw6bAUXP4Q)
+    raise ValueError("Falta la variable de entorno TOKEN")
 if not API_URL:
-    raise ValueError("❌ https://script.google.com/macros/s/AKfycbytoaZjRotNGaIJschKfL_bvb-sLHMnATo810fGt7YKVk46NFv-MVAaNTX9XXpau1c/exec")
+    raise ValueError("Falta la variable de entorno API_URL")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -48,6 +49,8 @@ UBICACIONES = [
     "Obra 3",
 ]
 
+BILLINGS = [f"Billing {i}" for i in range(1, 10)]
+
 ESTADOS = {
     "MENU": "menu",
     "UBICACION": "ubicacion",
@@ -56,6 +59,7 @@ ESTADOS = {
     "ALMUERZO": "almuerzo",
     "MATERIAL_LISTA": "material_lista",
     "MATERIAL_CANTIDAD": "material_cantidad",
+    "FINALIZAR_OBSERVACION": "finalizar_observacion",
 }
 
 USER_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -80,18 +84,29 @@ def is_positive_int(texto: str) -> bool:
     return texto.isdigit() and int(texto) > 0
 
 
-def should_ignore_duplicate(context: ContextTypes.DEFAULT_TYPE, action_key: str, window_seconds: float = 1.3) -> bool:
+def should_ignore_duplicate(
+    context: ContextTypes.DEFAULT_TYPE,
+    action_key: str,
+    window_seconds: float = 1.3,
+) -> bool:
     now_ts = time.time()
     last_key = context.user_data.get("_last_action_key")
     last_ts = context.user_data.get("_last_action_ts", 0.0)
+
     if last_key == action_key and (now_ts - last_ts) <= window_seconds:
         return True
+
     context.user_data["_last_action_key"] = action_key
     context.user_data["_last_action_ts"] = now_ts
     return False
 
 
-def reset_user_state(context: ContextTypes.DEFAULT_TYPE, user_id: str, nombre: Optional[str] = None, es_lider: Optional[bool] = None) -> None:
+def reset_user_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: str,
+    nombre: Optional[str] = None,
+    es_lider: Optional[bool] = None,
+) -> None:
     context.user_data.clear()
     context.user_data["estado"] = ESTADOS["MENU"]
     context.user_data["user_id"] = user_id
@@ -102,17 +117,14 @@ def reset_user_state(context: ContextTypes.DEFAULT_TYPE, user_id: str, nombre: O
 
 
 def menu_principal(es_lider: bool = False) -> ReplyKeyboardMarkup:
-    rows = [
-        ["🟢 Iniciar turno"],
-    ]
+    rows = [["🟢 Iniciar turno"]]
     if es_lider:
         rows.append(["📦 Solicitar material"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def menu_ubicaciones() -> ReplyKeyboardMarkup:
-    rows = [[u] for u in UBICACIONES]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup([[u] for u in UBICACIONES], resize_keyboard=True)
 
 
 def menu_billing() -> ReplyKeyboardMarkup:
@@ -144,7 +156,20 @@ def menu_materiales(materiales: List[Dict[str, Any]]) -> ReplyKeyboardMarkup:
     rows = [[f'{m["codigo"]} - {m["material"]} ({m["stock_actual"]})'] for m in materiales[:40]]
     if not rows:
         rows = [["SIN MATERIALES"]]
+    rows.append(["↩️ Cancelar"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def menu_cancelar_simple() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["↩️ Cancelar"]], resize_keyboard=True)
+
+
+def menu_por_estado(estado: str, es_lider: bool) -> ReplyKeyboardMarkup:
+    if estado == ESTADOS["ALMUERZO"]:
+        return menu_almuerzo(es_lider)
+    if estado == ESTADOS["TRABAJANDO"]:
+        return menu_trabajo(es_lider)
+    return menu_principal(es_lider)
 
 
 async def post_init(app: Application) -> None:
@@ -175,20 +200,16 @@ async def post_shutdown(app: Application) -> None:
 async def api_get(context: ContextTypes.DEFAULT_TYPE, params: Dict[str, Any]) -> Dict[str, Any]:
     client: httpx.AsyncClient = context.application.bot_data["http"]
     try:
-        r = await client.get(API_URL, params=params)
-        r.raise_for_status()
-        data = r.json()
+        response = await client.get(API_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
         return data if isinstance(data, dict) else {"ok": False, "error": "respuesta_invalida"}
     except httpx.ReadTimeout:
         logger.warning("ReadTimeout API params=%s", params)
         return {"ok": False, "error": "timeout"}
-    except Exception as e:
-        logger.exception("Error API: %s", e)
-        return {"ok": False, "error": str(e)}
-
-
-async def async_noop() -> None:
-    return
+    except Exception as exc:
+        logger.exception("Error API: %s", exc)
+        return {"ok": False, "error": str(exc)}
 
 
 async def api_with_recovery(
@@ -206,8 +227,7 @@ async def api_with_recovery(
     if resp.get("error") != "timeout":
         return resp
 
-    await context.application.create_task(async_noop())
-    time.sleep(0.8)
+    await asyncio.sleep(0.8)
 
     retry = dict(payload)
     retry["event_id"] = make_event_id(user_id, f'{payload.get("accion", "retry")}-retry')
@@ -223,7 +243,11 @@ async def api_with_recovery(
     return resp2
 
 
-async def consultar_usuario(context: ContextTypes.DEFAULT_TYPE, user_id: str, force: bool = False) -> Dict[str, Any]:
+async def consultar_usuario(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: str,
+    force: bool = False,
+) -> Dict[str, Any]:
     cached = USER_CACHE.get(user_id)
     if not force and cached and cached.get("expires_at", 0) > time.time():
         return cached["data"]
@@ -233,7 +257,11 @@ async def consultar_usuario(context: ContextTypes.DEFAULT_TYPE, user_id: str, fo
     return data
 
 
-async def cargar_materiales(context: ContextTypes.DEFAULT_TYPE, user_id: str, force: bool = False) -> List[Dict[str, Any]]:
+async def cargar_materiales(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: str,
+    force: bool = False,
+) -> List[Dict[str, Any]]:
     if not force and MATERIAL_CACHE["expires_at"] > time.time():
         return MATERIAL_CACHE["data"]
 
@@ -251,16 +279,78 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await consultar_usuario(context, user_id, force=True)
 
     if not user.get("ok"):
-        await update.message.reply_text(f"❌ Usuario no registrado\n🆔 {user_id}")
+        if update.message:
+            await update.message.reply_text(f"❌ Usuario no registrado\n🆔 {user_id}")
         return
 
     es_lider = str(user.get("es_lider", "NO")).upper() == "SI"
     reset_user_state(context, user_id, user.get("nombre"), es_lider)
 
-    await update.message.reply_text(
-        f"👋 Hola {user.get('nombre')}",
-        reply_markup=menu_principal(es_lider),
+    if update.message:
+        await update.message.reply_text(
+            f"👋 Hola {user.get('nombre')}",
+            reply_markup=menu_principal(es_lider),
+        )
+
+
+async def finalizar_con_observacion(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: str,
+    es_lider: bool,
+    observaciones: str,
+) -> None:
+    payload = {
+        "user": user_id,
+        "accion": "finalizar_jornada",
+        "fin": now_iso(),
+        "observaciones": observaciones,
+        "event_id": make_event_id(user_id, "finalizar_jornada"),
+    }
+
+    resp = await api_with_recovery(
+        user_id,
+        context,
+        payload,
+        success_if_retry_error="no_open_session",
     )
+
+    if not resp.get("ok"):
+        context.user_data["estado"] = context.user_data.get("estado_prev_finalizar", ESTADOS["TRABAJANDO"])
+        await update.message.reply_text(
+            f'❌ No pude finalizar jornada\nDetalle: {resp.get("error", "sin detalle")}',
+            reply_markup=menu_por_estado(context.user_data["estado"], es_lider),
+        )
+        return
+
+    resumen = await api_get(context, {"api": "resumen_pago", "user": user_id})
+    nombre = context.user_data.get("nombre")
+    reset_user_state(context, user_id, nombre, es_lider)
+
+    if resumen.get("ok"):
+        msg = (
+            "✅ Jornada finalizada\n"
+            f"📝 Labor registrada: {observaciones}\n\n"
+            f"🕒 Horas del día: {resumen.get('horas_dia_texto', '0h 00m')}\n"
+            f"📅 Acumulado corte actual: {resumen.get('horas_corte_texto', '0h 00m')}\n"
+            f"• Ordinarias: {resumen.get('horas_ordinarias_texto', '0h 00m')}\n"
+            f"• Extra: {resumen.get('horas_extra_texto', '0h 00m')}\n"
+        )
+        if resumen.get("pago_disponible"):
+            msg += (
+                "\n💰 Pago proyectado:\n"
+                f"• Ordinario: ${resumen.get('pago_ordinario', 0):,.0f}\n"
+                f"• Extra: ${resumen.get('pago_extra', 0):,.0f}\n"
+                f"• Bruto: ${resumen.get('total_bruto', 0):,.0f}\n"
+                f"• Descuento: ${resumen.get('descuento_total', 0):,.0f}\n"
+                f"• Neto: ${resumen.get('total_neto', 0):,.0f}\n"
+            )
+        else:
+            msg += "\n💰 Pago proyectado: pendiente de parametrización por nómina"
+    else:
+        msg = f"✅ Jornada finalizada\n📝 Labor registrada: {observaciones}"
+
+    await update.message.reply_text(msg, reply_markup=menu_principal(es_lider))
 
 
 async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -278,9 +368,31 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["user_id"] = user_id
         context.user_data["nombre"] = user.get("nombre")
         context.user_data["es_lider"] = str(user.get("es_lider", "NO")).upper() == "SI"
+        context.user_data["estado"] = ESTADOS["MENU"]
 
     es_lider = bool(context.user_data.get("es_lider", False))
     estado = context.user_data.get("estado", ESTADOS["MENU"])
+
+    if estado == ESTADOS["FINALIZAR_OBSERVACION"]:
+        if texto == "↩️ Cancelar":
+            estado_retorno = context.user_data.get("estado_prev_finalizar", ESTADOS["TRABAJANDO"])
+            context.user_data["estado"] = estado_retorno
+            await update.message.reply_text(
+                "↩️ Finalización cancelada",
+                reply_markup=menu_por_estado(estado_retorno, es_lider),
+            )
+            return
+
+        observaciones = " ".join(texto.split())
+        if len(observaciones) < 5:
+            await update.message.reply_text(
+                "❌ Describe la labor con más detalle",
+                reply_markup=menu_cancelar_simple(),
+            )
+            return
+
+        await finalizar_con_observacion(update, context, user_id, es_lider, observaciones)
+        return
 
     if texto == "🟢 Iniciar turno":
         if should_ignore_duplicate(context, "iniciar_turno"):
@@ -300,7 +412,7 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if estado == ESTADOS["BILLING_NUMERO"]:
-        if texto not in [f"Billing {i}" for i in range(1, 10)]:
+        if texto not in BILLINGS:
             await update.message.reply_text("❌ Selecciona Billing 1 a Billing 9", reply_markup=menu_billing())
             return
 
@@ -314,7 +426,12 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "event_id": make_event_id(user_id, "inicio_turno"),
         }
 
-        resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="ya_existe_sesion_activa")
+        resp = await api_with_recovery(
+            user_id,
+            context,
+            payload,
+            success_if_retry_error="ya_existe_sesion_activa",
+        )
         if not resp.get("ok"):
             context.user_data["estado"] = ESTADOS["MENU"]
             await update.message.reply_text(
@@ -340,7 +457,12 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "fin": now_iso(),
             "event_id": make_event_id(user_id, "salida_almuerzo"),
         }
-        resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="no_open_session")
+        resp = await api_with_recovery(
+            user_id,
+            context,
+            payload,
+            success_if_retry_error="no_open_session",
+        )
         if not resp.get("ok"):
             await update.message.reply_text(
                 f"❌ No pude registrar salida almuerzo\nDetalle: {resp.get('error', 'sin detalle')}",
@@ -365,7 +487,12 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "inicio": context.user_data.get("inicio"),
             "event_id": make_event_id(user_id, "regreso_almuerzo"),
         }
-        resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="ya_existe_sesion_activa")
+        resp = await api_with_recovery(
+            user_id,
+            context,
+            payload,
+            success_if_retry_error="ya_existe_sesion_activa",
+        )
         if not resp.get("ok"):
             await update.message.reply_text(
                 f"❌ No pude registrar regreso almuerzo\nDetalle: {resp.get('error', 'sin detalle')}",
@@ -384,11 +511,21 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         materiales = await cargar_materiales(context, user_id, force=True)
         context.user_data["materiales_cache"] = materiales
+        context.user_data["estado_anterior_material"] = estado
         context.user_data["estado"] = ESTADOS["MATERIAL_LISTA"]
         await update.message.reply_text("📦 Selecciona material:", reply_markup=menu_materiales(materiales))
         return
 
     if estado == ESTADOS["MATERIAL_LISTA"]:
+        if texto == "↩️ Cancelar":
+            estado_retorno = context.user_data.get("estado_anterior_material", ESTADOS["TRABAJANDO"])
+            context.user_data["estado"] = estado_retorno
+            await update.message.reply_text(
+                "↩️ Solicitud cancelada",
+                reply_markup=menu_por_estado(estado_retorno, es_lider),
+            )
+            return
+
         materiales = context.user_data.get("materiales_cache", [])
         codigo = texto.split(" - ")[0].strip()
         material = next((m for m in materiales if str(m.get("codigo")) == codigo), None)
@@ -402,13 +539,26 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["estado"] = ESTADOS["MATERIAL_CANTIDAD"]
 
         await update.message.reply_text(
-            f'📦 {material["material"]}\nDisponible: {material.get("stock_actual", 0)}\n\nIngresa cantidad a solicitar:'
+            f'📦 {material["material"]}\nDisponible: {material.get("stock_actual", 0)}\n\nIngresa cantidad a solicitar:',
+            reply_markup=menu_cancelar_simple(),
         )
         return
 
     if estado == ESTADOS["MATERIAL_CANTIDAD"]:
+        if texto == "↩️ Cancelar":
+            estado_retorno = context.user_data.get("estado_anterior_material", ESTADOS["TRABAJANDO"])
+            context.user_data["estado"] = estado_retorno
+            await update.message.reply_text(
+                "↩️ Solicitud cancelada",
+                reply_markup=menu_por_estado(estado_retorno, es_lider),
+            )
+            return
+
         if not is_positive_int(texto):
-            await update.message.reply_text("❌ Ingresa una cantidad válida en números")
+            await update.message.reply_text(
+                "❌ Ingresa una cantidad válida en números",
+                reply_markup=menu_cancelar_simple(),
+            )
             return
 
         payload = {
@@ -421,17 +571,20 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "event_id": make_event_id(user_id, "solicitar_material"),
         }
         resp = await api_with_recovery(user_id, context, payload)
+        estado_retorno = context.user_data.get("estado_anterior_material", ESTADOS["TRABAJANDO"])
+
         if not resp.get("ok"):
+            context.user_data["estado"] = estado_retorno
             await update.message.reply_text(
                 f'❌ No pude registrar solicitud\nDetalle: {resp.get("error", "sin detalle")}',
-                reply_markup=menu_trabajo(es_lider) if context.user_data.get("estado_prev") != ESTADOS["ALMUERZO"] else menu_almuerzo(es_lider),
+                reply_markup=menu_por_estado(estado_retorno, es_lider),
             )
             return
 
-        context.user_data["estado"] = ESTADOS["TRABAJANDO"] if context.user_data.get("estado_anterior_material") != ESTADOS["ALMUERZO"] else ESTADOS["ALMUERZO"]
+        context.user_data["estado"] = estado_retorno
         await update.message.reply_text(
             f'✅ Solicitud registrada\n📦 {context.user_data.get("material_nombre")}\nCantidad: {texto}\nStock restante: {resp.get("stock_despues", "-")}',
-            reply_markup=menu_trabajo(es_lider) if context.user_data["estado"] == ESTADOS["TRABAJANDO"] else menu_almuerzo(es_lider),
+            reply_markup=menu_por_estado(estado_retorno, es_lider),
         )
         return
 
@@ -439,48 +592,19 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if should_ignore_duplicate(context, "finalizar_jornada"):
             return
 
-        payload = {
-            "user": user_id,
-            "accion": "finalizar_jornada",
-            "fin": now_iso(),
-            "event_id": make_event_id(user_id, "finalizar_jornada"),
-        }
-        resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="no_open_session")
-        if not resp.get("ok"):
-            await update.message.reply_text(
-                f'❌ No pude finalizar jornada\nDetalle: {resp.get("error", "sin detalle")}',
-                reply_markup=menu_trabajo(es_lider),
-            )
-            return
-
-        resumen = await api_get(context, {"api": "resumen_pago", "user": user_id})
-        nombre = context.user_data.get("nombre")
-        reset_user_state(context, user_id, nombre, es_lider)
-
-        if resumen.get("ok"):
-            msg = (
-                "✅ Jornada finalizada\n\n"
-                f"🕒 Horas del día: {resumen.get('horas_dia_texto', '0h 00m')}\n"
-                f"📅 Acumulado corte actual: {resumen.get('horas_corte_texto', '0h 00m')}\n"
-                f"• Ordinarias: {resumen.get('horas_ordinarias_texto', '0h 00m')}\n"
-                f"• Extra: {resumen.get('horas_extra_texto', '0h 00m')}\n"
-            )
-            if resumen.get("pago_disponible"):
-                msg += (
-                    "\n💰 Pago proyectado:\n"
-                    f"• Ordinario: ${resumen.get('pago_ordinario', 0):,.0f}\n"
-                    f"• Extra: ${resumen.get('pago_extra', 0):,.0f}\n"
-                    f"• Bruto: ${resumen.get('total_bruto', 0):,.0f}\n"
-                    f"• Descuento: ${resumen.get('descuento_total', 0):,.0f}\n"
-                    f"• Neto: ${resumen.get('total_neto', 0):,.0f}\n"
-                )
-            else:
-                msg += "\n💰 Pago proyectado: pendiente de parametrización por nómina"
-        else:
-            msg = "✅ Jornada finalizada"
-
-        await update.message.reply_text(msg, reply_markup=menu_principal(es_lider))
+        estado_actual = estado if estado in (ESTADOS["TRABAJANDO"], ESTADOS["ALMUERZO"]) else ESTADOS["TRABAJANDO"]
+        context.user_data["estado_prev_finalizar"] = estado_actual
+        context.user_data["estado"] = ESTADOS["FINALIZAR_OBSERVACION"]
+        await update.message.reply_text(
+            "📝 Describe la labor realizada hoy para cerrar la jornada:",
+            reply_markup=menu_cancelar_simple(),
+        )
         return
+
+    await update.message.reply_text(
+        "Selecciona una opción válida del menú",
+        reply_markup=menu_por_estado(estado, es_lider),
+    )
 
 
 def main() -> None:

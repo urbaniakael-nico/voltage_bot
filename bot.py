@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 import math
 import os
@@ -8,13 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from dotenv import load_dotenv
-from telegram import (
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    Update,
-)
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -24,7 +19,13 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv(override=True)
+try:
+    from dotenv import load_dotenv  # type: ignore
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv(override=True)
 
 TOKEN = os.getenv("TOKEN", "").strip()
 API_URL = os.getenv("API_URL", "").strip()
@@ -55,6 +56,8 @@ PUNTOS_AUTORIZADOS = [
     {"nombre": "Obra 3", "lat": 0.0, "lng": 0.0, "radio_m": 150},
 ]
 
+BILLINGS = [f"Billing {i}" for i in range(1, 10)]
+
 ESTADOS = {
     "MENU": "menu",
     "ESPERANDO_UBICACION": "esperando_ubicacion",
@@ -69,11 +72,11 @@ ESTADOS = {
 ACCION_VOLVER = "⬅️ Volver"
 ACCION_CANCELAR = "❌ Cancelar"
 ACCION_COMPARTIR_UBICACION = "📍 Enviar ubicación actual"
-
+ACCION_SIN_MATERIALES = "SIN MATERIALES"
 
 USER_CACHE: Dict[str, Dict[str, Any]] = {}
 USER_CACHE_TTL = 30
-MATERIAL_CACHE: Dict[str, Any] = {"expires_at": 0, "data": []}
+MATERIAL_CACHE: Dict[str, Any] = {"expires_at": 0.0, "data": []}
 MATERIAL_CACHE_TTL = 60
 
 
@@ -108,27 +111,22 @@ def should_ignore_duplicate(
     return False
 
 
-def get_menu_by_state(es_lider: bool, estado: str) -> ReplyKeyboardMarkup:
-    if estado == ESTADOS["ALMUERZO"]:
-        return menu_almuerzo(es_lider)
-    if estado == ESTADOS["TRABAJANDO"]:
-        return menu_trabajo(es_lider)
-    return menu_principal(es_lider)
-
-
 def reset_user_state(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: str,
     nombre: Optional[str] = None,
     es_lider: Optional[bool] = None,
 ) -> None:
+    keep = {
+        "user_id": user_id,
+        "nombre": nombre if nombre is not None else context.user_data.get("nombre"),
+        "es_lider": es_lider if es_lider is not None else context.user_data.get("es_lider", False),
+    }
     context.user_data.clear()
     context.user_data["estado"] = ESTADOS["MENU"]
-    context.user_data["user_id"] = user_id
-    if nombre is not None:
-        context.user_data["nombre"] = nombre
-    if es_lider is not None:
-        context.user_data["es_lider"] = es_lider
+    context.user_data["user_id"] = keep["user_id"]
+    context.user_data["nombre"] = keep["nombre"]
+    context.user_data["es_lider"] = keep["es_lider"]
 
 
 def menu_principal(es_lider: bool = False) -> ReplyKeyboardMarkup:
@@ -138,7 +136,7 @@ def menu_principal(es_lider: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-def menu_ubicacion_actual() -> ReplyKeyboardMarkup:
+def menu_compartir_ubicacion() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(ACCION_COMPARTIR_UBICACION, request_location=True)],
         [ACCION_CANCELAR],
@@ -173,56 +171,80 @@ def menu_almuerzo(es_lider: bool = False) -> ReplyKeyboardMarkup:
 
 
 def menu_materiales(materiales: List[Dict[str, Any]]) -> ReplyKeyboardMarkup:
-    rows = [[f'{m["codigo"]} - {m["material"]} ({m["stock_actual"]})'] for m in materiales[:40]]
+    rows: List[List[str]] = []
+    for m in materiales[:40]:
+        rows.append([f'{m["codigo"]} - {m["material"]} ({m["stock_actual"]})'])
+    if not rows:
+        rows = [[ACCION_SIN_MATERIALES]]
     rows.append([ACCION_VOLVER, ACCION_CANCELAR])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def menu_cantidad_material() -> ReplyKeyboardMarkup:
-    rows = [
-        ["1", "2", "3"],
-        ["5", "10", "20"],
-        [ACCION_VOLVER, ACCION_CANCELAR],
-    ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup([[ACCION_VOLVER, ACCION_CANCELAR]], resize_keyboard=True)
 
 
-def haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    r = 6371000
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-
-    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+def menu_finalizar_observacion() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[ACCION_VOLVER, ACCION_CANCELAR]], resize_keyboard=True)
 
 
-def gps_validation_enabled() -> bool:
+def get_menu_by_state(es_lider: bool, estado: str) -> ReplyKeyboardMarkup:
+    if estado == ESTADOS["ALMUERZO"]:
+        return menu_almuerzo(es_lider)
+    if estado == ESTADOS["TRABAJANDO"]:
+        return menu_trabajo(es_lider)
+    return menu_principal(es_lider)
+
+
+def puntos_autorizados_configurados() -> bool:
     for p in PUNTOS_AUTORIZADOS:
-        if abs(float(p["lat"])) > 0.000001 or abs(float(p["lng"])) > 0.000001:
+        if abs(float(p.get("lat", 0.0))) > 0.000001 or abs(float(p.get("lng", 0.0))) > 0.000001:
             return True
     return False
 
 
-def validar_punto_gps(lat: float, lng: float) -> Tuple[bool, str, float]:
-    if not gps_validation_enabled():
-        return True, f"GPS {lat:.6f}, {lng:.6f}", 0.0
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radio = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    return 2.0 * radio * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
-    mejor_punto = None
-    mejor_distancia = None
 
+def resolve_punto_gps(lat: float, lng: float) -> Tuple[bool, str, Optional[Dict[str, Any]], Optional[float]]:
+    if not puntos_autorizados_configurados():
+        return True, "⚠️ Validación GPS automática desactivada", None, None
+
+    best_punto: Optional[Dict[str, Any]] = None
+    best_dist: Optional[float] = None
     for p in PUNTOS_AUTORIZADOS:
-        dist = haversine_distance_m(lat, lng, float(p["lat"]), float(p["lng"]))
-        if mejor_distancia is None or dist < mejor_distancia:
-            mejor_distancia = dist
-            mejor_punto = p
+        dist = haversine_m(lat, lng, float(p["lat"]), float(p["lng"]))
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_punto = p
 
-    if not mejor_punto or mejor_distancia is None:
-        return False, "sin_punto", 0.0
+    if best_punto is None or best_dist is None:
+        return False, "❌ No pude validar el punto GPS", None, None
 
-    permitido = mejor_distancia <= float(mejor_punto["radio_m"])
-    return permitido, str(mejor_punto["nombre"]), round(mejor_distancia, 2)
+    radio = float(best_punto.get("radio_m", 150))
+    if best_dist <= radio:
+        return True, f"✅ Punto validado: {best_punto['nombre']} ({best_dist:.0f} m)", best_punto, best_dist
+
+    return (
+        False,
+        f"❌ Fuera del punto autorizado.\n📍 Más cercano: {best_punto['nombre']}\n📏 Distancia: {best_dist:.0f} m\n🎯 Radio permitido: {radio:.0f} m",
+        best_punto,
+        best_dist,
+    )
+
+
+def build_ubicacion_text(lat: float, lng: float, punto: Optional[Dict[str, Any]]) -> str:
+    gps_text = f"GPS {lat:.6f}, {lng:.6f}"
+    if punto and punto.get("nombre"):
+        return f"{punto['nombre']} | {gps_text}"
+    return gps_text
 
 
 async def post_init(app: Application) -> None:
@@ -260,9 +282,9 @@ async def api_get(context: ContextTypes.DEFAULT_TYPE, params: Dict[str, Any]) ->
     except httpx.ReadTimeout:
         logger.warning("ReadTimeout API params=%s", params)
         return {"ok": False, "error": "timeout"}
-    except Exception as e:
-        logger.exception("Error API: %s", e)
-        return {"ok": False, "error": str(e)}
+    except Exception as exc:
+        logger.exception("Error API: %s", exc)
+        return {"ok": False, "error": str(exc)}
 
 
 async def api_with_recovery(
@@ -280,7 +302,8 @@ async def api_with_recovery(
     if resp.get("error") != "timeout":
         return resp
 
-    await context.application.create_task(asyncio_sleep())
+    await asyncio.sleep(0.8)
+
     retry = dict(payload)
     retry["event_id"] = make_event_id(user_id, f'{payload.get("accion", "retry")}-retry')
     resp2 = await api_get(context, retry)
@@ -295,16 +318,7 @@ async def api_with_recovery(
     return resp2
 
 
-async def asyncio_sleep() -> None:
-    import asyncio
-    await asyncio.sleep(0.8)
-
-
-async def consultar_usuario(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: str,
-    force: bool = False,
-) -> Dict[str, Any]:
+async def consultar_usuario(context: ContextTypes.DEFAULT_TYPE, user_id: str, force: bool = False) -> Dict[str, Any]:
     cached = USER_CACHE.get(user_id)
     if not force and cached and cached.get("expires_at", 0) > time.time():
         return cached["data"]
@@ -314,11 +328,7 @@ async def consultar_usuario(
     return data
 
 
-async def cargar_materiales(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: str,
-    force: bool = False,
-) -> List[Dict[str, Any]]:
+async def cargar_materiales(context: ContextTypes.DEFAULT_TYPE, user_id: str, force: bool = False) -> List[Dict[str, Any]]:
     if not force and MATERIAL_CACHE["expires_at"] > time.time():
         return MATERIAL_CACHE["data"]
 
@@ -331,147 +341,194 @@ async def cargar_materiales(
     return []
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def ensure_user_loaded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Tuple[str, bool]]:
     user_id = get_user_id(update)
-    user = await consultar_usuario(context, user_id, force=True)
+    if context.user_data.get("user_id"):
+        return user_id, bool(context.user_data.get("es_lider", False))
 
+    user = await consultar_usuario(context, user_id, force=True)
     if not user.get("ok"):
-        await update.message.reply_text(f"❌ Usuario no registrado\n🆔 {user_id}")
-        return
+        if update.effective_message:
+            await update.effective_message.reply_text(f"❌ Usuario no registrado\n🆔 {user_id}")
+        return None
 
     es_lider = str(user.get("es_lider", "NO")).upper() == "SI"
     reset_user_state(context, user_id, user.get("nombre"), es_lider)
+    return user_id, es_lider
 
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    loaded = await ensure_user_loaded(update, context)
+    if not loaded or not update.message:
+        return
+
+    _, es_lider = loaded
     await update.message.reply_text(
-        f"👋 Hola {user.get('nombre')}",
+        f"👋 Hola {context.user_data.get('nombre')}",
         reply_markup=menu_principal(es_lider),
     )
 
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = get_user_id(update)
-    user = await consultar_usuario(context, user_id, force=False)
-
-    if not user.get("ok"):
-        await update.message.reply_text(f"❌ Usuario no registrado\n🆔 {user_id}")
+    loaded = await ensure_user_loaded(update, context)
+    if not loaded or not update.message:
         return
 
-    es_lider = str(user.get("es_lider", "NO")).upper() == "SI"
-    nombre = user.get("nombre")
-    estado_actual = context.user_data.get("estado", ESTADOS["MENU"]) if context.user_data.get("user_id") == user_id else ESTADOS["MENU"]
-
-    if context.user_data.get("user_id") != user_id:
-        reset_user_state(context, user_id, nombre, es_lider)
-        estado_actual = ESTADOS["MENU"]
-    else:
-        context.user_data["nombre"] = nombre
-        context.user_data["es_lider"] = es_lider
-
-    await update.message.reply_text(
-        f"📋 Menú disponible para {nombre}",
-        reply_markup=get_menu_by_state(es_lider, estado_actual),
-    )
+    _, es_lider = loaded
+    estado = context.user_data.get("estado", ESTADOS["MENU"])
+    await update.message.reply_text("📋 Menú actualizado", reply_markup=get_menu_by_state(es_lider, estado))
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = get_user_id(update)
-    user = await consultar_usuario(context, user_id, force=False)
-
-    if not user.get("ok"):
-        await update.message.reply_text(f"❌ Usuario no registrado\n🆔 {user_id}")
+    loaded = await ensure_user_loaded(update, context)
+    if not loaded or not update.message:
         return
 
-    es_lider = str(user.get("es_lider", "NO")).upper() == "SI"
-    reset_user_state(context, user_id, user.get("nombre"), es_lider)
-
-    await update.message.reply_text(
-        "✅ Operación cancelada",
-        reply_markup=menu_principal(es_lider),
-    )
+    user_id, es_lider = loaded
+    nombre = context.user_data.get("nombre")
+    reset_user_state(context, user_id, nombre, es_lider)
+    await update.message.reply_text("❌ Operación cancelada", reply_markup=menu_principal(es_lider))
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    loaded = await ensure_user_loaded(update, context)
+    if not loaded or not update.message:
+        return
+
+    _, es_lider = loaded
+    texto = (
         "Comandos disponibles:\n"
-        "/start - Iniciar sesión del bot\n"
-        "/menu - Recuperar el teclado actual\n"
-        "/cancel - Cancelar el flujo actual y volver al menú"
+        "/start - iniciar menú\n"
+        "/menu - recuperar teclado\n"
+        "/cancel - cancelar operación actual\n"
+        "/help - ver ayuda\n\n"
+        "Flujo:\n"
+        "1. Iniciar turno\n"
+        "2. Compartir ubicación actual\n"
+        "3. Seleccionar Billing\n"
+        "4. Salida / regreso almuerzo\n"
+        "5. Finalizar jornada con observación\n"
     )
-
-
-async def entrar_flujo_materiales(update: Update, context: ContextTypes.DEFAULT_TYPE, es_lider: bool) -> None:
-    if not es_lider:
-        await update.message.reply_text("❌ Solo líderes pueden solicitar material")
-        return
-
-    materiales = await cargar_materiales(context, get_user_id(update), force=True)
-    estado_anterior = context.user_data.get("estado", ESTADOS["MENU"])
-    context.user_data["estado_anterior_material"] = estado_anterior
-    context.user_data["materiales_cache"] = materiales
-
-    if not materiales:
-        context.user_data["estado"] = estado_anterior
-        await update.message.reply_text(
-            "📦 No hay materiales disponibles en inventario.\n\n"
-            "Revisa la hoja inventario: stock actual > 0 y activo = SI.",
-            reply_markup=get_menu_by_state(es_lider, estado_anterior),
-        )
-        return
-
-    context.user_data["estado"] = ESTADOS["MATERIAL_LISTA"]
+    if es_lider:
+        texto += "6. Solicitar material\n"
     await update.message.reply_text(
-        "📦 Selecciona material:",
-        reply_markup=menu_materiales(materiales),
+        texto,
+        reply_markup=get_menu_by_state(es_lider, context.user_data.get("estado", ESTADOS["MENU"])),
     )
 
 
-async def manejar_ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE, es_lider: bool) -> None:
+async def manejar_ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.location:
+        return
+
+    loaded = await ensure_user_loaded(update, context)
+    if not loaded:
+        return
+
+    _, es_lider = loaded
+    estado = context.user_data.get("estado", ESTADOS["MENU"])
+
+    if estado != ESTADOS["ESPERANDO_UBICACION"]:
         await update.message.reply_text(
-            "📍 Debes usar el botón de ubicación para continuar.",
-            reply_markup=menu_ubicacion_actual(),
+            "ℹ️ Ubicación recibida, pero ahora no era necesaria.",
+            reply_markup=get_menu_by_state(es_lider, estado),
         )
         return
 
-    lat = update.message.location.latitude
-    lng = update.message.location.longitude
+    lat = float(update.message.location.latitude)
+    lng = float(update.message.location.longitude)
 
-    permitido, punto_nombre, distancia = validar_punto_gps(lat, lng)
+    ok, mensaje, punto, _ = resolve_punto_gps(lat, lng)
+    if not ok:
+        await update.message.reply_text(
+            mensaje + "\n\n📍 Vuelve a compartir tu ubicación para iniciar turno.",
+            reply_markup=menu_compartir_ubicacion(),
+        )
+        return
 
-    context.user_data["ubicacion"] = punto_nombre
     context.user_data["gps_lat"] = lat
     context.user_data["gps_lng"] = lng
-
-    if not permitido:
-        await update.message.reply_text(
-            "❌ Ubicación fuera del punto autorizado.\n"
-            f"📍 Punto más cercano: {punto_nombre}\n"
-            f"📏 Distancia: {distancia} m\n\n"
-            "No se puede iniciar el turno desde esta ubicación.",
-            reply_markup=menu_principal(es_lider),
-        )
-        context.user_data["estado"] = ESTADOS["MENU"]
-        return
-
-    mensaje = "📍 Ubicación recibida\n"
-    if gps_validation_enabled():
-        mensaje += f"✅ Validado en punto: {punto_nombre}\n📏 Distancia: {distancia} m\n\n"
-    else:
-        mensaje += "⚠️ Validación GPS automática desactivada\n\n"
-
+    context.user_data["punto_nombre"] = punto.get("nombre") if punto else None
+    context.user_data["ubicacion"] = build_ubicacion_text(lat, lng, punto)
     context.user_data["estado"] = ESTADOS["BILLING_NUMERO"]
+
     await update.message.reply_text(
-        mensaje + "🏭 Selecciona Billing:",
+        "\n".join(["📍 Ubicación recibida", mensaje, "", "🏭 Selecciona Billing:"]),
         reply_markup=menu_billing(),
     )
 
 
-async def finalizar_con_observacion(update: Update, context: ContextTypes.DEFAULT_TYPE, es_lider: bool, texto: str) -> None:
+async def volver_desde_materiales(update: Update, context: ContextTypes.DEFAULT_TYPE, es_lider: bool) -> None:
+    estado_actual = context.user_data.get("estado")
+    estado_prev = context.user_data.get("estado_anterior_material", ESTADOS["TRABAJANDO"])
+
+    if estado_actual == ESTADOS["MATERIAL_CANTIDAD"]:
+        context.user_data["estado"] = ESTADOS["MATERIAL_LISTA"]
+        materiales = context.user_data.get("materiales_cache", [])
+        await update.message.reply_text("📦 Selecciona material:", reply_markup=menu_materiales(materiales))
+        return
+
+    context.user_data["estado"] = estado_prev
+    await update.message.reply_text("↩️ Regresaste al menú anterior", reply_markup=get_menu_by_state(es_lider, estado_prev))
+
+
+async def cancelar_operacion_actual(update: Update, context: ContextTypes.DEFAULT_TYPE, es_lider: bool) -> None:
+    estado = context.user_data.get("estado", ESTADOS["MENU"])
+
+    if estado in (ESTADOS["MATERIAL_LISTA"], ESTADOS["MATERIAL_CANTIDAD"]):
+        estado_prev = context.user_data.get("estado_anterior_material", ESTADOS["TRABAJANDO"])
+        context.user_data["estado"] = estado_prev
+        await update.message.reply_text(
+            "❌ Solicitud de material cancelada",
+            reply_markup=get_menu_by_state(es_lider, estado_prev),
+        )
+        return
+
+    if estado == ESTADOS["FINALIZAR_OBSERVACION"]:
+        estado_prev = context.user_data.get("estado_pre_finalizar", ESTADOS["TRABAJANDO"])
+        context.user_data["estado"] = estado_prev
+        await update.message.reply_text("❌ Cierre cancelado", reply_markup=get_menu_by_state(es_lider, estado_prev))
+        return
+
+    if estado == ESTADOS["ESPERANDO_UBICACION"]:
+        context.user_data["estado"] = ESTADOS["MENU"]
+        await update.message.reply_text("❌ Inicio de turno cancelado", reply_markup=menu_principal(es_lider))
+        return
+
+    if estado == ESTADOS["BILLING_NUMERO"]:
+        context.user_data["estado"] = ESTADOS["ESPERANDO_UBICACION"]
+        await update.message.reply_text("❌ Selección de Billing cancelada", reply_markup=menu_compartir_ubicacion())
+        return
+
+    await update.message.reply_text("❌ Operación cancelada", reply_markup=get_menu_by_state(es_lider, estado))
+
+
+async def finalizar_con_observacion(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    es_lider: bool,
+    observacion: str,
+) -> None:
+    if not update.message:
+        return
+
     user_id = get_user_id(update)
-    observacion = texto.strip()
+    observacion = observacion.strip()
+
+    if observacion in (ACCION_VOLVER, ACCION_CANCELAR):
+        if observacion == ACCION_VOLVER:
+            estado_prev = context.user_data.get("estado_pre_finalizar", ESTADOS["TRABAJANDO"])
+            context.user_data["estado"] = estado_prev
+            await update.message.reply_text("↩️ Regresaste al menú anterior", reply_markup=get_menu_by_state(es_lider, estado_prev))
+            return
+
+        await cancelar_operacion_actual(update, context, es_lider)
+        return
+
     if len(observacion) < 5:
         await update.message.reply_text(
-            "✍️ Describe mejor la labor realizada. Mínimo 5 caracteres.",
+            "❌ Describe mejor la labor realizada. Mínimo 5 caracteres.",
+            reply_markup=menu_finalizar_observacion(),
         )
         return
 
@@ -482,19 +539,13 @@ async def finalizar_con_observacion(update: Update, context: ContextTypes.DEFAUL
         "observacion": observacion,
         "event_id": make_event_id(user_id, "finalizar_jornada"),
     }
-    resp = await api_with_recovery(
-        user_id,
-        context,
-        payload,
-        success_if_retry_error="no_open_session",
-    )
-
+    resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="no_open_session")
     if not resp.get("ok"):
-        estado_retorno = context.user_data.get("estado_pre_finalizar", ESTADOS["TRABAJANDO"])
-        context.user_data["estado"] = estado_retorno
+        estado_prev = context.user_data.get("estado_pre_finalizar", ESTADOS["TRABAJANDO"])
+        context.user_data["estado"] = estado_prev
         await update.message.reply_text(
             f'❌ No pude finalizar jornada\nDetalle: {resp.get("error", "sin detalle")}',
-            reply_markup=get_menu_by_state(es_lider, estado_retorno),
+            reply_markup=get_menu_by_state(es_lider, estado_prev),
         )
         return
 
@@ -532,40 +583,39 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    user_id = get_user_id(update)
-
-    if not context.user_data.get("user_id"):
-        user = await consultar_usuario(context, user_id, force=True)
-        if not user.get("ok"):
-            if update.message.text:
-                await update.message.reply_text("❌ Usuario no válido")
-            return
-        context.user_data["user_id"] = user_id
-        context.user_data["nombre"] = user.get("nombre")
-        context.user_data["es_lider"] = str(user.get("es_lider", "NO")).upper() == "SI"
-        context.user_data["estado"] = ESTADOS["MENU"]
-
-    es_lider = bool(context.user_data.get("es_lider", False))
-    estado = context.user_data.get("estado", ESTADOS["MENU"])
-    texto = (update.message.text or "").strip()
-
-    if estado == ESTADOS["ESPERANDO_UBICACION"] and update.message.location:
-        await manejar_ubicacion(update, context, es_lider)
+    if update.message.location:
+        await manejar_ubicacion(update, context)
         return
 
+    if not update.message.text:
+        return
+
+    texto = update.message.text.strip()
+    loaded = await ensure_user_loaded(update, context)
+    if not loaded:
+        return
+
+    user_id, es_lider = loaded
+    estado = context.user_data.get("estado", ESTADOS["MENU"])
+
     if texto == ACCION_CANCELAR:
-        estado_retorno = context.user_data.get("estado_anterior_material", ESTADOS["MENU"])
+        await cancelar_operacion_actual(update, context, es_lider)
+        return
+
+    if texto == ACCION_VOLVER:
+        if estado in (ESTADOS["MATERIAL_LISTA"], ESTADOS["MATERIAL_CANTIDAD"]):
+            await volver_desde_materiales(update, context, es_lider)
+            return
         if estado == ESTADOS["FINALIZAR_OBSERVACION"]:
-            estado_retorno = context.user_data.get("estado_pre_finalizar", ESTADOS["TRABAJANDO"])
-        context.user_data["estado"] = estado_retorno if estado in (
-            ESTADOS["MATERIAL_LISTA"],
-            ESTADOS["MATERIAL_CANTIDAD"],
-            ESTADOS["FINALIZAR_OBSERVACION"],
-        ) else ESTADOS["MENU"]
-        await update.message.reply_text(
-            "❌ Operación cancelada",
-            reply_markup=get_menu_by_state(es_lider, context.user_data["estado"]),
-        )
+            estado_prev = context.user_data.get("estado_pre_finalizar", ESTADOS["TRABAJANDO"])
+            context.user_data["estado"] = estado_prev
+            await update.message.reply_text("↩️ Regresaste al menú anterior", reply_markup=get_menu_by_state(es_lider, estado_prev))
+            return
+        if estado == ESTADOS["BILLING_NUMERO"]:
+            context.user_data["estado"] = ESTADOS["ESPERANDO_UBICACION"]
+            await update.message.reply_text("↩️ Vuelve a compartir tu ubicación.", reply_markup=menu_compartir_ubicacion())
+            return
+        await update.message.reply_text("ℹ️ No hay una pantalla anterior disponible.", reply_markup=get_menu_by_state(es_lider, estado))
         return
 
     if texto == "🟢 Iniciar turno":
@@ -574,79 +624,31 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["inicio"] = now_iso()
         context.user_data["estado"] = ESTADOS["ESPERANDO_UBICACION"]
         await update.message.reply_text(
-            "📍 Envía tu ubicación actual para validar el punto de inicio.",
-            reply_markup=menu_ubicacion_actual(),
+            "📍 Comparte tu ubicación actual para validar el punto de inicio.",
+            reply_markup=menu_compartir_ubicacion(),
         )
         return
 
     if estado == ESTADOS["ESPERANDO_UBICACION"]:
-        await update.message.reply_text(
-            "📍 Usa el botón 'Enviar ubicación actual' para continuar.",
-            reply_markup=menu_ubicacion_actual(),
-        )
+        await update.message.reply_text("📍 Usa el botón de ubicación del teclado para continuar.", reply_markup=menu_compartir_ubicacion())
         return
 
-    if texto == ACCION_VOLVER:
-        if estado == ESTADOS["MATERIAL_CANTIDAD"]:
-            context.user_data["estado"] = ESTADOS["MATERIAL_LISTA"]
-            await update.message.reply_text(
-                "📦 Selecciona material:",
-                reply_markup=menu_materiales(context.user_data.get("materiales_cache", [])),
-            )
-            return
-        if estado == ESTADOS["MATERIAL_LISTA"]:
-            estado_prev = context.user_data.get("estado_anterior_material", ESTADOS["MENU"])
-            context.user_data["estado"] = estado_prev
-            await update.message.reply_text(
-                "↩️ Volviste al menú anterior.",
-                reply_markup=get_menu_by_state(es_lider, estado_prev),
-            )
-            return
-        if estado == ESTADOS["BILLING_NUMERO"]:
-            context.user_data["estado"] = ESTADOS["ESPERANDO_UBICACION"]
-            await update.message.reply_text(
-                "📍 Envía nuevamente tu ubicación actual.",
-                reply_markup=menu_ubicacion_actual(),
-            )
-            return
-        if estado == ESTADOS["FINALIZAR_OBSERVACION"]:
-            estado_prev = context.user_data.get("estado_pre_finalizar", ESTADOS["TRABAJANDO"])
-            context.user_data["estado"] = estado_prev
-            await update.message.reply_text(
-                "↩️ Regresaste al menú anterior.",
-                reply_markup=get_menu_by_state(es_lider, estado_prev),
-            )
-            return
-
     if estado == ESTADOS["BILLING_NUMERO"]:
-        if texto not in [f"Billing {i}" for i in range(1, 10)]:
-            await update.message.reply_text(
-                "❌ Selecciona Billing 1 a Billing 9",
-                reply_markup=menu_billing(),
-            )
+        if texto not in BILLINGS:
+            await update.message.reply_text("❌ Selecciona un Billing válido.", reply_markup=menu_billing())
             return
 
         context.user_data["area"] = texto
-        gps_lat = context.user_data.get("gps_lat")
-        gps_lng = context.user_data.get("gps_lng")
-
         payload = {
             "user": user_id,
             "accion": "inicio_turno",
-            "ubicacion": context.user_data.get("ubicacion"),
+            "ubicacion": context.user_data.get("ubicacion", ""),
             "area": context.user_data.get("area"),
             "inicio": context.user_data.get("inicio"),
-            "gps_lat": gps_lat,
-            "gps_lng": gps_lng,
             "event_id": make_event_id(user_id, "inicio_turno"),
         }
 
-        resp = await api_with_recovery(
-            user_id,
-            context,
-            payload,
-            success_if_retry_error="ya_existe_sesion_activa",
-        )
+        resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="ya_existe_sesion_activa")
         if not resp.get("ok"):
             context.user_data["estado"] = ESTADOS["MENU"]
             await update.message.reply_text(
@@ -656,13 +658,18 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         context.user_data["estado"] = ESTADOS["TRABAJANDO"]
-        await update.message.reply_text(
-            "⚡ Turno iniciado\n"
-            f"📍 Punto: {context.user_data.get('ubicacion', '-')}\n"
-            f"🛰️ GPS: {gps_lat:.6f},{gps_lng:.6f}\n"
-            f"🏭 {context.user_data['area']}",
-            reply_markup=menu_trabajo(es_lider),
-        )
+        ubicacion = context.user_data.get("ubicacion", "")
+        gps_lat = context.user_data.get("gps_lat")
+        gps_lng = context.user_data.get("gps_lng")
+
+        partes = ["⚡ Turno iniciado"]
+        if ubicacion:
+            partes.append(f"📍 Punto: {ubicacion}")
+        if gps_lat is not None and gps_lng is not None:
+            partes.append(f"🛰 GPS: {gps_lat:.6f},{gps_lng:.6f}")
+        partes.append(f"🏭 {context.user_data['area']}")
+
+        await update.message.reply_text("\n".join(partes), reply_markup=menu_trabajo(es_lider))
         return
 
     if texto == "🍽 Salida almuerzo":
@@ -675,12 +682,7 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "fin": now_iso(),
             "event_id": make_event_id(user_id, "salida_almuerzo"),
         }
-        resp = await api_with_recovery(
-            user_id,
-            context,
-            payload,
-            success_if_retry_error="no_open_session",
-        )
+        resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="no_open_session")
         if not resp.get("ok"):
             await update.message.reply_text(
                 f"❌ No pude registrar salida almuerzo\nDetalle: {resp.get('error', 'sin detalle')}",
@@ -700,17 +702,12 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         payload = {
             "user": user_id,
             "accion": "regreso_almuerzo",
-            "ubicacion": context.user_data.get("ubicacion"),
+            "ubicacion": context.user_data.get("ubicacion", ""),
             "area": context.user_data.get("area"),
             "inicio": context.user_data.get("inicio"),
             "event_id": make_event_id(user_id, "regreso_almuerzo"),
         }
-        resp = await api_with_recovery(
-            user_id,
-            context,
-            payload,
-            success_if_retry_error="ya_existe_sesion_activa",
-        )
+        resp = await api_with_recovery(user_id, context, payload, success_if_retry_error="ya_existe_sesion_activa")
         if not resp.get("ok"):
             await update.message.reply_text(
                 f"❌ No pude registrar regreso almuerzo\nDetalle: {resp.get('error', 'sin detalle')}",
@@ -719,32 +716,44 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         context.user_data["estado"] = ESTADOS["TRABAJANDO"]
-        await update.message.reply_text(
-            "🔁 Regreso de almuerzo registrado",
-            reply_markup=menu_trabajo(es_lider),
-        )
+        await update.message.reply_text("🔁 Regreso de almuerzo registrado", reply_markup=menu_trabajo(es_lider))
         return
 
     if texto == "📦 Solicitar material":
-        await entrar_flujo_materiales(update, context, es_lider)
-        return
+        if not es_lider:
+            await update.message.reply_text("❌ Solo líderes pueden solicitar material")
+            return
 
-    if estado == ESTADOS["MATERIAL_LISTA"]:
-        if texto == "SIN MATERIALES":
+        materiales = await cargar_materiales(context, user_id, force=True)
+        context.user_data["materiales_cache"] = materiales
+        context.user_data["estado_anterior_material"] = estado if estado in (ESTADOS["TRABAJANDO"], ESTADOS["ALMUERZO"]) else ESTADOS["TRABAJANDO"]
+        context.user_data["estado"] = ESTADOS["MATERIAL_LISTA"]
+
+        if not materiales:
             await update.message.reply_text(
-                "❌ No hay materiales cargados. Usa ⬅️ Volver o ❌ Cancelar.",
-                reply_markup=menu_materiales(context.user_data.get("materiales_cache", [])),
+                "📦 No hay materiales activos disponibles en inventario.",
+                reply_markup=ReplyKeyboardMarkup([[ACCION_VOLVER, ACCION_CANCELAR]], resize_keyboard=True),
             )
             return
 
+        await update.message.reply_text("📦 Selecciona material:", reply_markup=menu_materiales(materiales))
+        return
+
+    if estado == ESTADOS["MATERIAL_LISTA"]:
         materiales = context.user_data.get("materiales_cache", [])
+
+        if texto == ACCION_SIN_MATERIALES or not materiales:
+            await update.message.reply_text(
+                "📦 No hay materiales para seleccionar.",
+                reply_markup=ReplyKeyboardMarkup([[ACCION_VOLVER, ACCION_CANCELAR]], resize_keyboard=True),
+            )
+            return
+
         codigo = texto.split(" - ")[0].strip()
         material = next((m for m in materiales if str(m.get("codigo")) == codigo), None)
+
         if not material:
-            await update.message.reply_text(
-                "❌ Selecciona un material válido",
-                reply_markup=menu_materiales(materiales),
-            )
+            await update.message.reply_text("❌ Selecciona un material válido", reply_markup=menu_materiales(materiales))
             return
 
         context.user_data["material_codigo"] = material["codigo"]
@@ -753,9 +762,7 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["estado"] = ESTADOS["MATERIAL_CANTIDAD"]
 
         await update.message.reply_text(
-            f'📦 {material["material"]}\n'
-            f'Disponible: {material.get("stock_actual", 0)}\n\n'
-            "Ingresa cantidad a solicitar:",
+            f'📦 {material["material"]}\nDisponible: {material.get("stock_actual", 0)}\n\nIngresa cantidad a solicitar:',
             reply_markup=menu_cantidad_material(),
         )
         return
@@ -763,7 +770,7 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if estado == ESTADOS["MATERIAL_CANTIDAD"]:
         if not is_positive_int(texto):
             await update.message.reply_text(
-                "❌ Ingresa una cantidad válida en números",
+                "❌ Ingresa una cantidad válida en números enteros",
                 reply_markup=menu_cantidad_material(),
             )
             return
@@ -779,7 +786,6 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         }
         resp = await api_with_recovery(user_id, context, payload)
         if not resp.get("ok"):
-            estado_back = context.user_data.get("estado_anterior_material", ESTADOS["TRABAJANDO"])
             context.user_data["estado"] = ESTADOS["MATERIAL_CANTIDAD"]
             await update.message.reply_text(
                 f'❌ No pude registrar solicitud\nDetalle: {resp.get("error", "sin detalle")}',
@@ -787,15 +793,12 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        MATERIAL_CACHE["expires_at"] = 0
+        MATERIAL_CACHE["expires_at"] = 0.0
         estado_prev = context.user_data.get("estado_anterior_material", ESTADOS["TRABAJANDO"])
         context.user_data["estado"] = estado_prev
 
         await update.message.reply_text(
-            f'✅ Solicitud registrada\n'
-            f'📦 {context.user_data.get("material_nombre")}\n'
-            f'Cantidad: {texto}\n'
-            f'Stock restante: {resp.get("stock_despues", "-")}',
+            f'✅ Solicitud registrada\n📦 {context.user_data.get("material_nombre")}\nCantidad: {texto}\nStock restante: {resp.get("stock_despues", "-")}',
             reply_markup=get_menu_by_state(es_lider, estado_prev),
         )
         return
@@ -808,7 +811,7 @@ async def manejar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["estado"] = ESTADOS["FINALIZAR_OBSERVACION"]
         await update.message.reply_text(
             "📝 Describe la labor realizada hoy para cerrar la jornada:",
-            reply_markup=ReplyKeyboardMarkup([[ACCION_VOLVER, ACCION_CANCELAR]], resize_keyboard=True),
+            reply_markup=menu_finalizar_observacion(),
         )
         return
 
@@ -835,7 +838,7 @@ def main() -> None:
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.LOCATION, manejar))
+    app.add_handler(MessageHandler(filters.LOCATION, manejar_ubicacion))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar))
 
     logger.info("🚀 VOLTAGE BOT ONLINE")
